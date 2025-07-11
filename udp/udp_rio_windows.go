@@ -18,9 +18,6 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/slackhq/nebula/config"
-	"github.com/slackhq/nebula/firewall"
-	"github.com/slackhq/nebula/header"
-
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/conn/winrio"
 )
@@ -95,6 +92,25 @@ func (u *RIOConn) bind(sa windows.Sockaddr) error {
 	// Enable v4 for this socket
 	syscall.SetsockoptInt(syscall.Handle(u.sock), syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, 0)
 
+	// Disable reporting of PORT_UNREACHABLE and NET_UNREACHABLE errors from the UDP socket receive call.
+	// These errors are returned on Windows during UDP receives based on the receipt of ICMP packets. Disable
+	// the UDP receive error returns with these ioctl calls.
+	ret := uint32(0)
+	flag := uint32(0)
+	size := uint32(unsafe.Sizeof(flag))
+	err = syscall.WSAIoctl(syscall.Handle(u.sock), syscall.SIO_UDP_CONNRESET, (*byte)(unsafe.Pointer(&flag)), size, nil, 0, &ret, nil, 0)
+	if err != nil {
+		return err
+	}
+	ret = 0
+	flag = 0
+	size = uint32(unsafe.Sizeof(flag))
+	SIO_UDP_NETRESET := uint32(syscall.IOC_IN | syscall.IOC_VENDOR | 15)
+	err = syscall.WSAIoctl(syscall.Handle(u.sock), SIO_UDP_NETRESET, (*byte)(unsafe.Pointer(&flag)), size, nil, 0, &ret, nil, 0)
+	if err != nil {
+		return err
+	}
+
 	err = u.rx.Open()
 	if err != nil {
 		return err
@@ -118,32 +134,22 @@ func (u *RIOConn) bind(sa windows.Sockaddr) error {
 	return nil
 }
 
-func (u *RIOConn) ListenOut(r EncReader, lhf LightHouseHandlerFunc, cache *firewall.ConntrackCacheTicker, q int) {
-	plaintext := make([]byte, MTU)
+func (u *RIOConn) ListenOut(r EncReader) {
 	buffer := make([]byte, MTU)
-	h := &header.H{}
-	fwPacket := &firewall.Packet{}
-	nb := make([]byte, 12, 12)
 
 	for {
 		// Just read one packet at a time
 		n, rua, err := u.receive(buffer)
 		if err != nil {
-			u.l.WithError(err).Debug("udp socket is closed, exiting read loop")
-			return
+			if errors.Is(err, net.ErrClosed) {
+				u.l.WithError(err).Debug("udp socket is closed, exiting read loop")
+				return
+			}
+			u.l.WithError(err).Error("unexpected udp socket receive error")
+			continue
 		}
 
-		r(
-			netip.AddrPortFrom(netip.AddrFrom16(rua.Addr).Unmap(), (rua.Port>>8)|((rua.Port&0xff)<<8)),
-			plaintext[:0],
-			buffer[:n],
-			h,
-			fwPacket,
-			lhf,
-			nb,
-			q,
-			cache.Get(u.l),
-		)
+		r(netip.AddrPortFrom(netip.AddrFrom16(rua.Addr).Unmap(), (rua.Port>>8)|((rua.Port&0xff)<<8)), buffer[:n])
 	}
 }
 
